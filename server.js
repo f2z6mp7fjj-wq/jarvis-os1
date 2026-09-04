@@ -1,99 +1,103 @@
-// Carga variables de entorno desde un archivo .env en desarrollo local
-// (en producción, la plataforma de hosting suele inyectarlas directamente).
-require('dotenv').config();
-
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-
-// Node 18+ trae 'fetch' de forma nativa (global). Si se ejecuta en una
-// versión anterior, se usa el paquete 'node-fetch' como respaldo.
-if (typeof fetch === 'undefined') {
-    global.fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-}
-
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DB_FILE = path.join(__dirname, 'memory.json');
 
 app.use(express.json());
 
-// 1. MANEJO DE MEMORIA PERSISTENTE (DB JSON)
-function getMemory() {
-    if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ conceptos: {}, historial: [] }));
-    try { return JSON.parse(fs.readFileSync(DB_FILE)); } catch (e) { return { conceptos: {}, historial: [] }; }
-}
-function saveMemory(data) { fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2)); }
+// Archivo local de memoria dentro del servidor
+const MEMORY_FILE = path.join(__dirname, 'memory.json');
 
-// 2. ENDPOINT CON GEMINI AI + SEARCH + MEMORIA
+function getMemory() {
+    if (!fs.existsSync(MEMORY_FILE)) {
+        fs.writeFileSync(MEMORY_FILE, JSON.stringify({ history: [], concepts: {} }, null, 2));
+    }
+    try {
+        return JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'));
+    } catch (e) {
+        return { history: [], concepts: {} };
+    }
+}
+
+function saveMemory(data) {
+    fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2));
+}
+
+// Endpoint para procesar la voz / texto enviado
 app.post('/api/chat', async (req, res) => {
     const { message } = req.body;
-    if (!message) return res.status(400).json({ error: 'Mensaje vacío.' });
     const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) return res.json({ response: "Configura GEMINI_API_KEY en las variables del servidor." });
 
-    const memory = getMemory();
-    const contextoPrevio = Object.entries(memory.conceptos).map(([k, v]) => `${k}: ${v}`).join("\n");
+    if (!apiKey) {
+        return res.status(500).json({ error: 'Falta configurar GEMINI_API_KEY en Render.' });
+    }
+
+    let memory = getMemory();
+    memory.history.push({ role: 'user', content: message });
+
+    // Contexto del sistema + Memoria acumulada
+    const systemInstruction = `Eres JARVIS, un asistente de IA avanzado, directo, conciso y elegante. 
+    Tienes acceso a búsquedas en tiempo real a través de Google. 
+    Tienes memoria de conversaciones anteriores: ${JSON.stringify(memory.history.slice(-10))}.
+    Responde en español de forma fluida y natural para síntesis de voz.`;
 
     try {
+        // Llamada a la API de Gemini con Search Grounding activado
         const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                contents: [
-                    ...memory.historial.slice(-6),
-                    { role: 'user', parts: [{ text: message }] }
-                ],
-                tools: [{ googleSearch: {} }],
-                systemInstruction: {
-                    parts: [{
-                        text: `Eres JARVIS, un asistente IA avanzado, conciso y futurista. Responde en español en máximo 2 oraciones para ser leídas por voz. 
-                        Aprende y consulta tus conocimientos previos:\n${contextoPrevio}`
-                    }]
-                }
+                contents: [{ role: 'user', parts: [{ text: message }] }],
+                systemInstruction: { parts: [{ text: systemInstruction }] },
+                tools: [{ googleSearch: {} }] // Permite investigar clima, noticias e información en tiempo real
             })
         });
 
         const data = await response.json();
-        const respuestaIA = data.candidates?.[0]?.content?.parts?.[0]?.text || "No pude procesar la consulta.";
+        const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || "No pude procesar la solicitud.";
 
-        // Guardar interacción y conceptos aprendidos
-        memory.historial.push({ role: 'user', parts: [{ text: message }] });
-        memory.historial.push({ role: 'model', parts: [{ text: respuestaIA }] });
-        if (message.toLowerCase().includes('qué es') || message.toLowerCase().includes('concepto')) {
-            const clave = message.replace(/que es|concepto|de|el|la|un|una/gi, '').trim();
-            if (clave) memory.conceptos[clave] = respuestaIA;
-        }
+        // Guardar la respuesta en la memoria
+        memory.history.push({ role: 'model', content: reply });
         saveMemory(memory);
 
-        return res.json({ response: respuestaIA });
+        res.json({ reply });
     } catch (error) {
-        return res.json({ response: "Error de conexión con la inteligencia artificial." });
+        console.error(error);
+        res.status(500).json({ error: 'Error al conectar con Gemini API.' });
     }
 });
 
-// 3. INTERFAZ FRONTEND HOLOGRÁFICA 3D (THREE.JS)
+// Interfaz Web HTML / THREE.JS
 app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
+    res.send(`
+<!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>JARVIS OS</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: #020204; color: #00f0ff; font-family: system-ui, sans-serif; height: 100vh; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; user-select: none; }
-        #canvas-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
-        #ui { position: relative; z-index: 2; text-align: center; pointer-events: none; }
-        #status { font-size: 0.85rem; letter-spacing: 6px; text-transform: uppercase; text-shadow: 0 0 12px #00f0ff; opacity: 0.8; margin-top: 250px; }
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { background:#020204; color:#00f0ff; font-family:-apple-system, sans-serif; height:100vh; overflow:hidden; display:flex; flex-direction:column; align-items:center; justify-content:center; }
+        #canvas-container { position:absolute; top:0; left:0; width:100%; height:100%; z-index:1; }
+        #ui { position:relative; z-index:2; text-align:center; pointer-events:none; padding: 20px; }
+        #status { font-size:1.1rem; letter-spacing:4px; text-transform:uppercase; text-shadow:0 0 12px #00f0ff; margin-top:260px; font-weight:bold; }
+        #subtext { font-size:0.85rem; color:rgba(0,240,255,0.7); margin-top:10px; max-width: 800px; }
     </style>
 </head>
-<body onclick="iniciarJARVIS()">
+<body onclick="toggleEscucha()">
     <div id="canvas-container"></div>
-    <div id="ui"><p id="status">TOCA PARA INICIAR SISTEMA</p></div>
+    <div id="ui">
+        <p id="status">TOCA LA PANTALLA PARA HABLAR</p>
+        <p id="subtext">SISTEMA LISTO</p>
+    </div>
+
     <script>
         let scene, camera, renderer, particleSystem, geometry;
-        let count = 1500, estado = 'IDLE', wavePhase = 0;
+        let count = 2000, estado = 'IDLE';
+        let recognition, synth = window.speechSynthesis;
 
         function init3D() {
             scene = new THREE.Scene();
@@ -122,73 +126,65 @@ app.get('/', (req, res) => {
 
         function animate() {
             requestAnimationFrame(animate);
-            particleSystem.rotation.y += (estado === 'THINKING' ? 0.03 : 0.005);
-            let pos = geometry.attributes.position.array;
-            wavePhase += 0.15;
-            for (let i = 0; i < count * 3; i += 3) {
-                if (estado === 'SPEAKING') {
-                    pos[i+1] += Math.sin(wavePhase + pos[i]) * 0.008; // Efecto de cuerdas vocales
-                }
-            }
-            geometry.attributes.position.needsUpdate = true;
+            particleSystem.rotation.y += (estado === 'THINKING' ? 0.04 : 0.005);
+            particleSystem.rotation.x += (estado === 'THINKING' ? 0.02 : 0.002);
             renderer.render(scene, camera);
         }
 
-        function setEstado(e) {
-            estado = e;
-            document.getElementById('status').innerText = e;
+        function setEstado(nuevoEstado, texto) {
+            estado = nuevoEstado;
+            document.getElementById('status').innerText = texto || estado;
             let c = particleSystem.material.color;
-            if (e === 'LISTENING') c.setHex(0x00f0ff);
-            else if (e === 'THINKING') c.setHex(0xffaa00);
-            else if (e === 'SPEAKING') c.setHex(0x00ffaa);
+            if (estado === 'LISTENING') c.setHex(0x00f0ff);
+            else if (estado === 'THINKING') c.setHex(0xffaa00);
+            else if (estado === 'SPEAKING') c.setHex(0x00ffaa);
             else c.setHex(0x00f0ff);
         }
 
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        let recognition, isProcessing = false, iniciado = false;
+        function initSpeech() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) return alert("Tu navegador no soporta entrada de voz.");
+            
+            recognition = new SpeechRecognition();
+            recognition.lang = 'es-ES';
+            recognition.onstart = () => setEstado('LISTENING', 'ESCUCHANDO...');
+            
+            recognition.onresult = async (event) => {
+                const text = event.results[0][0].transcript;
+                document.getElementById('subtext').innerText = '"' + text + '"';
+                setEstado('THINKING', 'INVESTIGANDO / PROCESANDO...');
 
-        function hablar(texto, alTerminar) {
-            if (!('speechSynthesis' in window)) return alTerminar && alTerminar();
-            window.speechSynthesis.cancel();
-            const u = new SpeechSynthesisUtterance(texto);
-            u.lang = 'es-MX'; u.rate = 1.0; u.pitch = 0.85;
-            u.onstart = () => setEstado('SPEAKING');
-            u.onend = u.onerror = () => { setEstado('LISTENING'); alTerminar && alTerminar(); };
-            window.speechSynthesis.speak(u);
+                const res = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: text })
+                });
+
+                const data = await res.json();
+                hablar(data.reply);
+            };
         }
 
-        function escuchar() {
-            if (!SpeechRecognition) return;
-            if (!recognition) {
-                recognition = new SpeechRecognition();
-                recognition.lang = 'es-MX'; recognition.continuous = true; recognition.interimResults = false;
-                recognition.onresult = async (e) => {
-                    if (isProcessing) return;
-                    const texto = e.results[e.resultIndex][0].transcript.trim();
-                    if (texto.length > 0) {
-                        isProcessing = true;
-                        setEstado('THINKING');
-                        try {
-                            const res = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: texto }) });
-                            const data = await res.json();
-                            hablar(data.response, () => { isProcessing = false; });
-                        } catch (err) { hablar("Error de conexión.", () => { isProcessing = false; }); }
-                    }
-                };
-                recognition.onend = () => { if (!isProcessing) try { recognition.start(); } catch(e){} };
-            }
-            try { recognition.start(); setEstado('LISTENING'); } catch(e){}
+        function hablar(texto) {
+            setEstado('SPEAKING', 'RESPONDIENDO...');
+            document.getElementById('subtext').innerText = texto;
+            const utterance = new SpeechSynthesisUtterance(texto);
+            utterance.lang = 'es-ES';
+            utterance.onend = () => setEstado('IDLE', 'TOCA PARA HABLAR NUEVAMENTE');
+            synth.speak(utterance);
         }
 
-        function iniciarJARVIS() {
-            if (iniciado) return;
-            iniciado = true;
-            init3D();
-            hablar("Sistemas activados. Hola Juan Manuel.", () => escuchar());
+        function toggleEscucha() {
+            if (!particleSystem) init3D();
+            if (!recognition) initSpeech();
+            recognition.start();
         }
+
+        init3D();
     </script>
 </body>
-</html>`);
+</html>
+    `);
 });
 
-app.listen(PORT, () => console.log(`Servidor activo en el puerto ${PORT}`));
+app.listen(PORT, () => console.log("JARVIS corriendo en puerto " + PORT));
